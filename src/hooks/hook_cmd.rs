@@ -269,13 +269,17 @@ fn decide_hook_action(cmd: &str, host: permissions::Host, cwd: Option<&str>) -> 
 /// settings RTK reads and whose hook asks explicitly for a wrap. Copilot
 /// shares `Host::Claude` for its verdict but judges the returned command
 /// itself, so it keeps [`decide_hook_action`].
-fn decide_claude_hook_action(cmd: &str, cwd: Option<&str>) -> HookDecision {
+fn decide_claude_hook_action(
+    cmd: &str,
+    cwd: Option<&str>,
+    subagent_worktree: bool,
+) -> HookDecision {
     let permissions = permissions::check_claude_hook_command(cmd);
     if permissions.verdict == PermissionVerdict::Deny {
         return HookDecision::Deny;
     }
     crate::hooks::rewrite_cmd::track_tee_read(cmd);
-    decision::decide_for_claude_hook_at(cmd, &permissions, cwd)
+    decision::decide_for_claude_hook_at(cmd, &permissions, cwd, subagent_worktree)
 }
 
 fn handle_vscode(cmd: &str, input: &Value) -> Result<()> {
@@ -711,7 +715,13 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     };
 
     let cwd = v.get("cwd").and_then(Value::as_str);
-    process_claude_payload_from_decision(v, cmd, decide_claude_hook_action(cmd, cwd))
+    let agent_id = v.get("agent_id").and_then(Value::as_str);
+    let subagent_worktree = decision::is_subagent_in_linked_worktree(agent_id, cwd);
+    process_claude_payload_from_decision(
+        v,
+        cmd,
+        decide_claude_hook_action(cmd, cwd, subagent_worktree),
+    )
 }
 
 /// Pure core of `process_claude_payload`, taking the hook decision directly so the
@@ -1884,6 +1894,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn subagent_payload(cmd: &str, cwd: &std::path::Path, agent_id: Option<&str>) -> Value {
+        let mut v = claude_payload_with_ids(cmd, "sess-1", "toolu_01ABC", cwd.to_str().unwrap());
+        if let Some(id) = agent_id {
+            v["agent_id"] = json!(id);
+        }
+        v
+    }
+
+    fn linked_worktree_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/x",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn is_skip(v: &Value) -> bool {
+        matches!(
+            process_claude_payload(v),
+            PayloadAction::Skip {
+                decision: HookOutcome::Defer,
+                ..
+            }
+        )
+    }
+
+    fn is_rewrite(v: &Value) -> bool {
+        matches!(process_claude_payload(v), PayloadAction::Rewrite { .. })
+    }
+
+    #[test]
+    fn test_subagent_in_linked_worktree_skips_git() {
+        let dir = linked_worktree_dir();
+        let v = subagent_payload("git status", dir.path(), Some("agent-1"));
+        assert!(is_skip(&v));
+    }
+
+    #[test]
+    fn test_subagent_in_linked_worktree_skips_git_in_chain() {
+        let dir = linked_worktree_dir();
+        let v = subagent_payload("cd sub && git log", dir.path(), Some("agent-1"));
+        assert!(is_skip(&v));
+    }
+
+    #[test]
+    fn test_subagent_in_linked_worktree_still_rewrites_cargo() {
+        let dir = linked_worktree_dir();
+        let v = subagent_payload("cargo test", dir.path(), Some("agent-1"));
+        assert!(is_rewrite(&v));
+    }
+
+    #[test]
+    fn test_main_session_in_linked_worktree_rewrites_git() {
+        let dir = linked_worktree_dir();
+        let v = subagent_payload("git status", dir.path(), None);
+        assert!(is_rewrite(&v));
+    }
+
+    #[test]
+    fn test_subagent_in_normal_repo_rewrites_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let v = subagent_payload("git status", dir.path(), Some("agent-1"));
+        assert!(is_rewrite(&v));
     }
 
     #[test]

@@ -336,21 +336,41 @@ pub(crate) fn decide_for_agent_at(
         verdict,
         deny_rules.permit_wrap().then_some(|| deny_rules),
         cwd,
+        false,
     )
 }
 
 /// The real Claude hook and its diagnostic share the same permission snapshot.
+/// `subagent_worktree` is set for a subagent whose cwd is in a linked git
+/// worktree (see [`is_subagent_in_linked_worktree`]): git stays unrewritten.
 pub(crate) fn decide_for_claude_hook_at(
     cmd: &str,
     permissions: &super::permissions::ClaudeHookPermissions,
     cwd: Option<&str>,
+    subagent_worktree: bool,
 ) -> HookDecision {
     decide_for_agent_at_with_attestation(
         cmd,
         permissions.verdict,
         Some(|| permissions.deny_rules()),
         cwd,
+        subagent_worktree,
     )
+}
+
+/// Claude Code's worktree guard refuses `rtk git ...` from a subagent isolated
+/// in a worktree. The payload carries `agent_id` only for subagents, and a
+/// linked worktree has a `.git` file where a normal repository has a directory.
+pub(crate) fn is_subagent_in_linked_worktree(agent_id: Option<&str>, cwd: Option<&str>) -> bool {
+    agent_id.is_some_and(|a| !a.is_empty()) && cwd.is_some_and(in_linked_worktree)
+}
+
+fn in_linked_worktree(cwd: &str) -> bool {
+    std::path::Path::new(cwd)
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|git| git.exists())
+        .is_some_and(|git| git.is_file())
 }
 
 fn decide_for_agent_at_with_attestation(
@@ -358,9 +378,10 @@ fn decide_for_agent_at_with_attestation(
     verdict: PermissionVerdict,
     attest: Option<impl FnOnce() -> DenyRules>,
     cwd: Option<&str>,
+    subagent_worktree: bool,
 ) -> HookDecision {
     let (mut excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
-    if cwd.is_some_and(in_claude_worktree) {
+    if subagent_worktree || cwd.is_some_and(in_claude_worktree) {
         excluded.push("git".to_string());
     }
     suppress_identity(
@@ -567,7 +588,7 @@ impl AgentPath {
     pub(crate) fn decide(&self, cmd: &str) -> HookDecision {
         if matches!(self, Self::ClaudeHook) {
             let permissions = super::permissions::check_claude_hook_command(cmd);
-            return decide_for_claude_hook_at(cmd, &permissions, None);
+            return decide_for_claude_hook_at(cmd, &permissions, None, false);
         }
         let verdict = self.verdict(cmd);
         self.approval_owner().apply(
